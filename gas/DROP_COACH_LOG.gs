@@ -31,6 +31,13 @@
  *     「投稿前（サンプル参照）」「投稿前（サンプルなし）」として記録する（列構成は v4 と同じ。既存シートにそのまま追記）
  *   - variant が無い従来版（drop_coach_v2.html）は従来どおり「投稿済み」「投稿前」
  *
+ * ■ v6 の変更（フィードバックの 2 段階記録）
+ *   - 1 段階目：action:"log" で従来どおり 1 行追記（応答の sheet / row をフロントが保持）
+ *   - 2 段階目：action:"feedback" で、利用者が入力した評価・コメントを同じ行の右端の列に書き込む
+ *     { "action":"feedback", "token":"...", "sheet":"log", "row":12, "rating":4, "comment":"..." } → { ok:true, sheet, row }
+ *     ※ 書き込めるのは、同じ Name で 6 時間以内に記録した行だけ（他人の行は書き換えられない）。再送すると上書き
+ *   - フィードバック列（FB_HEADER）は LOG_HEADER の右側に追加。既存シートの見出し判定は LOG_HEADER 部分のみで行う
+ *
  * ■ v3 の変更（ログが記録されない不具合の修正）
  *   - 見出しが一致しない旧シートに当たった場合はエラーで止めず、列構成専用の別シート（<シート名>_xxxxxx）に記録
  *   - 新規シート（既定 26 列）に 31 列を書く前に列を追加。appendRow をやめ setValues で明示的に書く
@@ -42,7 +49,8 @@
  *   ステータス / エラー / モデル / プロンプト版 / キャッシュ / 所要秒 / 画像枚数 / 画像メモ /
  *   結論 / 視点の評価 / 視点の診断 / 読み取れた視点 / 視点を深める問い /
  *   診断 / 活かしたい点 / 伸びしろ / 参考投稿の傾向 / 共通点 / 共通点の根拠 /
- *   写真と本文の一致 / 写真の現状 / 写真の改善 / 写真の根拠 / 改善アクション / 改善後の本文 / 書き換えポイント / 注意点 / 結果JSON
+ *   写真と本文の一致 / 写真の現状 / 写真の改善 / 写真の根拠 / 改善アクション / 改善後の本文 / 書き換えポイント / 注意点 / 結果JSON /
+ *   フィードバック評価 / フィードバックコメント / フィードバック日時（v6：2 段階目で記入）
  *   - 参考投稿ID は R1, R2 … の順に並ぶので、根拠列の「R2」は 2 番目の ID に対応する（T は対象投稿ID）
  *   - 旧版の「Few-shot件数」列は廃止
  *
@@ -63,15 +71,18 @@ const LOG_HEADER = [
   '診断', '活かしたい点', '伸びしろ', '参考投稿の傾向', '共通点', '共通点の根拠',
   '写真と本文の一致', '写真の現状', '写真の改善', '写真の根拠', '改善アクション', '改善後の本文', '書き換えポイント', '注意点', '結果JSON'
 ];
+/** v6：2 段階目（action:"feedback"）で書き込む列。LOG_HEADER の右側に置く */
+const FB_HEADER = ['フィードバック評価', 'フィードバックコメント', 'フィードバック日時'];
+const FB_RATING_LABEL = { 1: '1 役に立たなかった', 2: '2 あまり役に立たなかった', 3: '3 どちらとも言えない', 4: '4 役に立った', 5: '5 とても役に立った' };
 const MODE_LABEL = { posted: '投稿済み', draft: '投稿前' };
 const VARIANT_LABEL = { with_sample: '投稿前（サンプル参照）', no_sample: '投稿前（サンプルなし）' };
 const DEFAULTS = { LOG_SHEET_NAME: 'coach_log_v3', TOKEN_TTL_SEC: 21600, MAX_FAILS: 30, MAX_LOGS_PER_TOKEN: 300 };
 const CACHE_MAX_SEC = 21600;
 const FAIL_WINDOW_SEC = 900;
-const MAX_LEN = { NAME: 40, GOAL: 20, NOTE: 200, ID: 64, TEXT: 400, DRAFT: 1000, CODE: 20, MSG: 300, META: 80, FIELD: 1000, ITEMS: 10, REFS: 20, JSON_CELL: 45000 };
+const MAX_LEN = { NAME: 40, GOAL: 20, NOTE: 200, ID: 64, TEXT: 400, DRAFT: 1000, CODE: 20, MSG: 300, META: 80, FIELD: 1000, ITEMS: 10, REFS: 20, JSON_CELL: 45000, FEEDBACK: 1000 };
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const EVI_RE = /^(T|R\d{1,2})$/;
-const KEY = { FAIL: 'coachlog_auth_fail', TOKEN: 'coachlogtok_' };
+const KEY = { FAIL: 'coachlog_auth_fail', TOKEN: 'coachlogtok_', ROW: 'coachlogrow_' };
 
 class AppError extends Error {
   constructor(code, message) { super(message); this.code = code; }
@@ -99,6 +110,7 @@ function doPost(e) {
     switch (req && req.action) {
       case 'login': return handleLogin_(req);
       case 'log':   return handleLog_(req);
+      case 'feedback': return handleFeedback_(req);
       default:      throw new AppError('BAD_REQUEST', '不明な action です');
     }
   } catch (err) {
@@ -112,9 +124,9 @@ function doPost(e) {
   }
 }
 
-/** ブラウザで LOG_URL を開くと疎通確認。?diag=1 で記録先の状態も返す（version が 5 でなければ新バージョン未デプロイ） */
+/** ブラウザで LOG_URL を開くと疎通確認。?diag=1 で記録先の状態も返す（version が 6 でなければ新バージョン未デプロイ） */
 function doGet(e) {
-  const out = { ok: true, service: 'drop-coach-log', version: 5, time: new Date().toISOString() };
+  const out = { ok: true, service: 'drop-coach-log', version: 6, time: new Date().toISOString() };
   if (e && e.parameter && e.parameter.diag) {
     out.password_set = !!prop_('APP_PASSWORD');
     out.sheet_id_set = !!prop_('LOG_SHEET_ID');
@@ -224,9 +236,59 @@ function handleLog_(req) {
   ]);
 
   session.n = (session.n || 0) + 1;
+  // v6：記録した行の持ち主（Name）を覚えておき、2 段階目（feedback）で本人の行だけ書き換えられるようにする
+  //     （再ログインでトークンが変わっても同じ Name なら書ける。保持は最大 6 時間）
+  cache.put(KEY.ROW + sha256_(written.sheet + '!' + written.row), session.name, CACHE_MAX_SEC);
   const rest = Math.floor((session.exp - Date.now()) / 1000);
   if (rest > 1) cache.put(key, JSON.stringify(session), Math.min(rest, CACHE_MAX_SEC));
   return json_({ ok: true, sheet: written.sheet, row: written.row });
+}
+
+/* ===================== フィードバック（v6：2 段階目） ===================== */
+function handleFeedback_(req) {
+  const cache = CacheService.getScriptCache();
+  const key = KEY.TOKEN + sha256_(String(req.token || ''));
+  let session = null;
+  try { session = JSON.parse(cache.get(key) || 'null'); } catch (e) {}
+  if (!req.token || !session || !session.name) {
+    throw new AppError('AUTH', 'ログ記録の認証期限が切れました。再ログインしてください');
+  }
+  const sheetName = clean_(req.sheet, 100);
+  const row = Math.round(Number(req.row));
+  if (!sheetName || !isFinite(row) || row < 2) throw new AppError('BAD_REQUEST', 'フィードバック先の行が不正です');
+  if (cache.get(KEY.ROW + sha256_(sheetName + '!' + row)) !== session.name) {
+    throw new AppError('BAD_REQUEST', 'この実行結果にはフィードバックできません（同じ Name で 6 時間以内に記録した結果のみ対象）');
+  }
+  const rating = Math.round(Number(req.rating));
+  const ratingLabel = FB_RATING_LABEL[rating] || '';
+  const comment = clean_(req.comment, MAX_LEN.FEEDBACK);
+  if (!ratingLabel && !comment) throw new AppError('BAD_REQUEST', '評価かコメントを入力してください');
+
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(10000); } catch (e) { throw new AppError('BUSY', 'ログ記録が混み合っています'); }
+  try {
+    const sh = openSpreadsheet_().getSheetByName(sheetName);
+    if (!sh || sh.getLastRow() < row) throw new AppError('BAD_REQUEST', 'フィードバック先の行が見つかりません');
+    const col = LOG_HEADER.length + 1;
+    ensureSize_(sh, row, col + FB_HEADER.length - 1);
+    ensureFbHeader_(sh);
+    const safe = v => (typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v);
+    sh.getRange(row, col, 1, FB_HEADER.length).setValues([[ratingLabel, safe(comment), new Date()]]);
+    sh.getRange(row, col + 2).setNumberFormat('yyyy/mm/dd hh:mm:ss');
+    SpreadsheetApp.flush();
+    return json_({ ok: true, sheet: sh.getName(), row: row });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** フィードバック列の見出しが無ければ書く（既存シートにも後から追加できるように） */
+function ensureFbHeader_(sh) {
+  const col = LOG_HEADER.length + 1;
+  ensureSize_(sh, 1, col + FB_HEADER.length - 1);
+  const rng = sh.getRange(1, col, 1, FB_HEADER.length);
+  const head = rng.getDisplayValues()[0].map(v => String(v).trim());
+  if (head.join('\t') !== FB_HEADER.join('\t')) rng.setValues([FB_HEADER]).setFontWeight('bold');
 }
 
 /** 参考投稿 ID（artwork_id）の配列を検証。順序（R1, R2 …）は保持し、重複・不正値は除外 */
@@ -323,6 +385,7 @@ function prepareSheet_(sh) {
     sh.setFrozenRows(1);
     sh.getRange('A:A').setNumberFormat('yyyy/mm/dd hh:mm:ss');
     sh.getRange(1, 1, sh.getMaxRows(), LOG_HEADER.length).setVerticalAlignment('top');
+    ensureFbHeader_(sh);
     return true;
   }
   if (sh.getMaxColumns() < LOG_HEADER.length) return false;
@@ -379,4 +442,7 @@ function setupTest() {
     }
   }).getContent());
   console.log('結果: ' + JSON.stringify(out) + ' / 最終行 ' + sh.getLastRow());
+  // v6：2 段階目（フィードバック）の書き込み確認。同じトークンで記録した行に書く
+  const fb = JSON.parse(handleFeedback_({ token: login.token, sheet: out.sheet, row: out.row, rating: 4, comment: '（フィードバック書き込み確認）' }).getContent());
+  console.log('フィードバック: ' + JSON.stringify(fb));
 }

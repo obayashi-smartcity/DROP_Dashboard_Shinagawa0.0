@@ -477,6 +477,15 @@
     /* 入力中（キーボード表示中）は下部の固定バーを隠す */
     body.typing .dock,body.typing .rundock{transform:translateY(110%);visibility:hidden}
   }
+  /* v6：フィードバック（ログの 2 段階目） */
+  .fb{margin-top:16px;border:1px solid var(--stroke);background:var(--rich-soft);padding:14px 16px}
+  .fb-q{font-weight:700;font-size:13px;margin-bottom:10px}
+  .fb-rate{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .fb .ta{background:#fff}
+  .fb-act{display:flex;align-items:center;gap:12px;margin-top:10px;flex-wrap:wrap}
+  .fb-msg{font-size:12px;color:var(--muted)}
+  .fb-msg.err{color:var(--err);font-weight:700}
+  .fb-msg.ok{color:var(--rich);font-weight:700}
 </style>
 </head>
 <body>
@@ -615,7 +624,20 @@
             <div class="placeholder"><b>まだ分析していません</b>参考にするサンプル投稿を確認して、実行ボタンを押してください。</div>
           </div>
           <div class="status" id="logStatus" hidden></div>
-          <div class="note" id="sendNote">AI による自動分析です。判断の参考としてご利用ください。送信するのは入力したコメント・表示名とサンプル投稿の本文（一部）・投稿日時・性別・年代、「画像も解析」が ON のときは画像（アップロード画像・サンプル投稿の画像を、このブラウザで長辺 512px に縮小したもの。位置情報などの撮影情報は含みません）、および入力した追加指示のみで、アカウント ID・位置情報は送信しません。実行のたびに Name・追加指示・参考にしたサンプル投稿の ID・入力したコメント・AI の改善提案を記録します（アップロード画像は記録しません）。</div>
+          <!-- v6：フィードバック（実行ログの行に追記される） -->
+          <div class="fb" id="fbBox" hidden>
+            <div class="fb-q">この改善提案は役に立ちましたか？</div>
+            <div class="fb-rate" id="fbRate">
+              <button type="button" class="chip" data-v="5">とても役に立った</button>
+              <button type="button" class="chip" data-v="4">役に立った</button>
+              <button type="button" class="chip" data-v="3">どちらとも言えない</button>
+              <button type="button" class="chip" data-v="2">あまり役に立たなかった</button>
+              <button type="button" class="chip" data-v="1">役に立たなかった</button>
+            </div>
+            <textarea class="ta" id="fbComment" rows="3" maxlength="1000" placeholder="良かった点・分かりにくかった点・ほしかった提案など（任意）"></textarea>
+            <div class="fb-act"><button type="button" class="btn sm" id="fbSend">フィードバックを送信</button><span class="fb-msg" id="fbMsg"></span></div>
+          </div>
+          <div class="note" id="sendNote">AI による自動分析です。判断の参考としてご利用ください。送信するのは入力したコメント・表示名とサンプル投稿の本文（一部）・投稿日時・性別・年代、「画像も解析」が ON のときは画像（アップロード画像・サンプル投稿の画像を、このブラウザで長辺 512px に縮小したもの。位置情報などの撮影情報は含みません）、および入力した追加指示のみで、アカウント ID・位置情報は送信しません。実行のたびに Name・追加指示・参考にしたサンプル投稿の ID・入力したコメント・AI の改善提案を記録します（アップロード画像は記録しません）。フィードバックを送信すると、評価とコメントも同じ記録に追加されます。</div>
         </div>
       </div>
     </div>
@@ -1175,6 +1197,7 @@ async function run(force) {
   status(`<span class="spin"></span><span>AI が${withImg ? "画像と本文を" : ""}解析して改善案を作成しています… <b id="sec">0</b> 秒</span>`);
   S.timer = setInterval(() => { const s = $("sec"); if (s) s.textContent = Math.floor((Date.now() - t0) / 1000); }, 250);
   const seq = S.runSeq = (S.runSeq || 0) + 1;
+  resetFeedback();
   const res = await post({ action: "coach", token: getToken(CONFIG.KEYS.TOKEN), variant: pl.variant, mode: pl.mode, goal: pl.goal, context: pl.context, target: pl.target, references: pl.references, instructions: pl.instructions, force: !!force }, CONFIG.GAS_URL);
   clearInterval(S.timer); S.busy = false;
   syncButtons(); $("result").classList.remove("loading");
@@ -1242,11 +1265,54 @@ async function sendLog(pl, res, sec, seq) {
   if (seq !== S.runSeq) return;   // 次の実行が始まっていたら表示しない
   if (r.ok) {
     console.info("実行ログを記録しました", r);
-    if (res.ok) $("resultMeta").textContent += " ・ ログ記録済み";
+    if (res.ok) { $("resultMeta").textContent += " ・ ログ記録済み"; showFeedback({ sheet: r.sheet, row: r.row }); }
     return;
   }
   console.warn("実行ログを記録できませんでした", r);
   logStatus(`※ 実行ログを記録できませんでした［${esc(r.code || "?")}］${esc(r.message || "不明なエラー")}`);
+}
+/* =====================================================================
+   フィードバック（v6：実行ログの 2 段階目）
+   - 1 段階目（sendLog）で記録された行（sheet / row）に、評価とコメントを書き込む
+   - 再送すると上書き。新しく実行するとリセットされる
+===================================================================== */
+function resetFeedback() {
+  S.fb = null; S.fbRating = 0;
+  $("fbBox").hidden = true; $("fbComment").value = "";
+  document.querySelectorAll("#fbRate .chip").forEach(b => b.classList.remove("on"));
+  $("fbSend").disabled = false; $("fbSend").textContent = "フィードバックを送信"; fbMsg("");
+}
+function showFeedback(ref) { resetFeedback(); S.fb = ref; $("fbBox").hidden = false; }
+function fbMsg(text, cls) { const el = $("fbMsg"); el.className = "fb-msg" + (cls ? " " + cls : ""); el.textContent = text || ""; }
+document.querySelectorAll("#fbRate .chip").forEach(b => b.addEventListener("click", () => {
+  S.fbRating = Number(b.dataset.v);
+  document.querySelectorAll("#fbRate .chip").forEach(x => x.classList.toggle("on", x === b));
+  fbMsg("");
+}));
+$("fbSend").addEventListener("click", sendFeedback);
+async function sendFeedback() {
+  if (!S.fb || !logEnabled()) return;
+  const comment = $("fbComment").value.trim();
+  if (!S.fbRating && !comment) { fbMsg("評価を選ぶか、コメントを入力してください", "err"); return; }
+  const ref = S.fb;
+  $("fbSend").disabled = true; fbMsg("送信中…");
+  const body = { action: "feedback", sheet: ref.sheet, row: ref.row, rating: S.fbRating, comment };
+  const send = () => post({ ...body, token: getToken(CONFIG.KEYS.LOG_TOKEN) }, CONFIG.LOG_URL);
+  let r = await send();
+  if (!r.ok && r.code === "AUTH") {
+    localStorage.removeItem(CONFIG.KEYS.LOG_TOKEN);
+    const c = getCreds();
+    if (c) {
+      const lr = await post({ action: "login", name: c.name, password: c.pw }, CONFIG.LOG_URL);
+      if (lr.ok) { setToken(lr.token, lr.expires_in, CONFIG.KEYS.LOG_TOKEN); r = await send(); }
+      else r = lr;
+    }
+  }
+  if (S.fb !== ref) return;   // 送信中に次の実行が始まった
+  $("fbSend").disabled = false;
+  if (r.ok) { $("fbSend").textContent = "フィードバックを更新"; fbMsg("送信しました。ありがとうございます", "ok"); return; }
+  console.warn("フィードバックを記録できませんでした", r);
+  fbMsg(`送信できませんでした［${r.code || "?"}］${r.message || "不明なエラー"}`, "err");
 }
 function logStatus(html) { const el = $("logStatus"); el.className = "status" + (html ? " error" : ""); el.innerHTML = html; el.hidden = !html; }
 function renderResult(r, pl) {
